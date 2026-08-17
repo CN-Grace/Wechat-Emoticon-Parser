@@ -1,0 +1,10 @@
+# 产出目录 (数据量大, 不入库)
+emoticon_export/
+emoticon_export_all/
+decoded_images/
+decrypted_db/
+wechat_keys.txt
+
+# Python
+__pycache__/
+*.pyc
