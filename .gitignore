@@ -8,3 +8,8 @@ wechat_keys.txt
 # Python
 __pycache__/
 *.pyc
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
