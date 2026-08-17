@@ -47,7 +47,7 @@ MAGICS = (b'\x89PNG', b'GIF8', b'\xff\xd8\xff', b'wxgf', b'RIFF')
 MEM_COMMIT = 0x1000
 READABLE = {2, 4, 8, 16, 32, 64, 128}
 MAX_REGION = 200 * 1024 * 1024
-CHUNK = 4 * 1024 * 1024
+CHUNK = 32 * 1024 * 1024  # 大块读取减少 syscall 往返
 RE_SEED = re.compile(rb'(?<![0-9])(\d{8,12})(?![0-9])')
 DEFAULT_BASES = [
     r"E:\Program\Tencent Files\xwechat_files",
@@ -77,15 +77,20 @@ def read_mem(h, addr, sz):
     return None
 
 
-def enum_regions(h):
+def enum_regions(h, writable_only=False):
     regs = []
     addr = 0
     mbi = MBI()
+    MEM_PRIVATE = 0x20000
+    WRITABLE = {0x04, 0x08, 0x40}  # READWRITE / WRITECOPY / EXECUTE_READWRITE
     while addr < 0x7FFFFFFFFFFF:
         if kernel32.VirtualQueryEx(h, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
             break
         if mbi.State == MEM_COMMIT and mbi.Protect in READABLE and 0 < mbi.RegionSize < MAX_REGION:
-            regs.append((mbi.BaseAddress, mbi.RegionSize))
+            if writable_only and not (mbi.Type == MEM_PRIVATE and mbi.Protect in WRITABLE):
+                pass  # 跳过只读区/映射文件区
+            else:
+                regs.append((mbi.BaseAddress, mbi.RegionSize))
         nxt = mbi.BaseAddress + mbi.RegionSize
         if nxt <= addr:
             break
@@ -108,7 +113,7 @@ def scan_seeds_from_memory(pid=None):
         if not h:
             print(f"[!] cannot open PID {pid}")
             continue
-        for base, size in enum_regions(h):
+        for base, size in enum_regions(h, writable_only=True):
             off = 0
             tail = b""
             while off < size:
@@ -145,13 +150,24 @@ def verify_key(key, c0):
 
 
 def find_key_from_memory(c0, wxid):
-    """内存扫描 seed -> 派生 -> C0 验证, 返回 (seed, key) 或 None"""
+    """内存扫描 seed -> 派生 -> C0 验证, 返回 (seed, key) 或 None (并行验证)"""
     seeds = scan_seeds_from_memory()
     print(f"[*] Verifying {len(seeds)} candidates (wxid={wxid})...")
-    for seed in sorted(seeds):
-        key = derive_key(seed, wxid)
-        if verify_key(key, c0):
-            return seed, key
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    n = min(16, (os.cpu_count() or 8))
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futs = {pool.submit(_verify_one, s, wxid, c0): s for s in sorted(seeds)}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                return r
+    return None
+
+
+def _verify_one(seed, wxid, c0):
+    key = derive_key(seed, wxid)
+    if verify_key(key, c0):
+        return seed, key
     return None
 
 
@@ -247,7 +263,7 @@ def wcdb_scan_candidate_keys(pid):
     if not h:
         return []
     try:
-        regions = enum_regions(h)
+        regions = enum_regions(h)  # DB key needle 在只读段 .rdata, 需全可读扫描
         needle_addrs = set()
         for base, size in regions:
             off = 0
@@ -646,6 +662,13 @@ def match_and_name(dec_dir, extracted, db_path, out_dir, do_wxgf=True):
         fav_md5s, pkg_names, caps, cap_pkg, file_info = set(), {}, {}, {}, {}
 
     clean = lambda s: re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(s)).strip() or 'untitled'
+
+    def _link_or_copy(src, dst):
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+
     n_pkg = n_fav = n_unk = 0
     sort_counter = {}  # 包 -> 递增序号 (unknown 无 sort_order_)
     used_names = {}  # (包名, 标题) -> 已用次数, 用于重名去重
@@ -681,7 +704,7 @@ def match_and_name(dec_dir, extracted, db_path, out_dir, do_wxgf=True):
             fn = f"{base}.{ext}" if cnt == 0 else f"{base}_{cnt+1}.{ext}"
             used_names[(pname, base)] = cnt + 1
             dst = os.path.join(pd, fn)
-            shutil.copy2(src, dst)
+            _link_or_copy(src, dst)
             pack = result["packs"].setdefault(pname, {"package_id": pid, "stickers": []})
             pack["stickers"].append({"md5": md5, "caption": caps.get(md5, ''), "sort": sort,
                                      "file": f"store/{pname}/{fn}", "ext": ext, "size": size})
@@ -700,14 +723,14 @@ def match_and_name(dec_dir, extracted, db_path, out_dir, do_wxgf=True):
                 used_names[(pname, base)] = cnt + 1
                 dst = os.path.join(pkg_dir, pname, fn)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
+                _link_or_copy(src, dst)
                 pack = result["packs"].setdefault(pname, {"package_id": pid, "stickers": []})
                 pack["stickers"].append({"md5": md5, "caption": cap, "sort": sort_counter[pname],
                                          "file": f"store/{pname}/{fn}", "ext": ext, "size": size})
                 n_pkg += 1
             else:
                 dst = os.path.join(unk_dir, f"{md5}.{ext}")
-                shutil.copy2(src, dst)
+                _link_or_copy(src, dst)
                 item = {"md5": md5, "file": f"unknown/{md5}.{ext}", "ext": ext, "size": size}
                 if cap:
                     item["caption"] = cap  # 保留标题信息供参考
@@ -1129,6 +1152,13 @@ def run_export(data_dir, wxid, emo_dir, out_dir="emoticon_export", key_hex=None,
         flat = os.path.join(os.path.dirname(os.path.abspath(out_dir)), "emoticon_export_all")
         os.makedirs(flat, exist_ok=True)
         clean_n = lambda s: re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(s)).strip() or 'untitled'
+
+        def _link_or_copy(src, dst):
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+
         used = set()
         n_flat = 0
 
@@ -1145,25 +1175,25 @@ def run_export(data_dir, wxid, emo_dir, out_dir="emoticon_export", key_hex=None,
             for s in pack["stickers"]:
                 base = clean_n(f"{pname}_{s.get('caption') or s['md5']}")
                 fn = uniq(base, s["ext"])
-                shutil.copy2(os.path.join(out_dir, s["file"]), os.path.join(flat, fn))
+                _link_or_copy(os.path.join(out_dir, s["file"]), os.path.join(flat, fn))
                 s["flat"] = fn
                 n_flat += 1
         for f in result["favorites"]:
             base = f"favorite_{f['sort']:03d}" if f.get("sort") is not None else f"favorite_{f['md5']}"
             fn = uniq(base, f["ext"])
-            shutil.copy2(os.path.join(out_dir, f["file"]), os.path.join(flat, fn))
+            _link_or_copy(os.path.join(out_dir, f["file"]), os.path.join(flat, fn))
             f["flat"] = fn
             n_flat += 1
         for i in result["unknown"]:
             fn = uniq(i["md5"], i["ext"])
-            shutil.copy2(os.path.join(out_dir, i["file"]), os.path.join(flat, fn))
+            _link_or_copy(os.path.join(out_dir, i["file"]), os.path.join(flat, fn))
             i["flat"] = fn
             n_flat += 1
         json.dump(result, open(os.path.join(out_dir, "manifest.json"), 'w', encoding='utf-8'),
                   ensure_ascii=False, indent=1)
         # 只保留平铺output: manifest 移入 flat, 删除默认目录
         if os.path.isfile(os.path.join(out_dir, "manifest.json")):
-            shutil.copy2(os.path.join(out_dir, "manifest.json"), os.path.join(flat, "manifest.json"))
+            _link_or_copy(os.path.join(out_dir, "manifest.json"), os.path.join(flat, "manifest.json"))
         shutil.rmtree(out_dir, ignore_errors=True)
         print(f"[*] Flattened output (--notype): {n_flat} files -> {flat}")
     print(f"[OK] {T('完成', 'Done')} in {time.time()-t0:.0f}s, {T('输出', 'output')}: {out_dir if not notype else flat}")
