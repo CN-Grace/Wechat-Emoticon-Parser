@@ -753,22 +753,28 @@ def match_and_name(dec_dir, extracted, db_path, out_dir, do_wxgf=True):
                 if item["file"].endswith(".wxgf"):
                     fp = os.path.join(out_dir, item["file"])
                     data = open(fp, 'rb').read()
-                    vps = data.find(b'\x00\x00\x00\x01\x40\x01')
-                    sps = data.find(b'\x00\x00\x00\x01\x42\x01')
-                    cut = min(x for x in (vps, sps) if x >= 0)
-                    if cut < 0:
-                        continue
                     hpath = fp + '.h265'
-                    open(hpath, 'wb').write(data[cut:])
-                    jpg = fp[:-5] + '.jpg'
+                    gif = fp[:-5] + '.gif'
+                    vf = 'split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse'
+                    # 整个 wxgf 直接转 GIF 动画 (含头转码 — VPS 可能在流中, 截取会丢参数集)
+                    open(hpath, 'wb').write(data)
                     r = subprocess.run([ff, '-y', '-hide_banner', '-loglevel', 'error',
-                                        '-i', hpath, '-frames:v', '1', jpg], capture_output=True)
+                                        '-i', hpath, '-vf', vf, '-loop', '0', gif], capture_output=True)
+                    if r.returncode != 0 or not (os.path.exists(gif) and os.path.getsize(gif) > 100):
+                        # fallback: 从 VPS 截取再试 (旧逻辑)
+                        vps = data.find(b'\x00\x00\x00\x01\x40\x01')
+                        sps = data.find(b'\x00\x00\x00\x01\x42\x01')
+                        cut = min(x for x in (vps, sps) if x >= 0)
+                        if cut >= 0:
+                            open(hpath, 'wb').write(data[cut:])
+                            r = subprocess.run([ff, '-y', '-hide_banner', '-loglevel', 'error',
+                                                '-i', hpath, '-vf', vf, '-loop', '0', gif], capture_output=True)
                     os.remove(hpath)
-                    if os.path.exists(jpg) and os.path.getsize(jpg) > 100:
+                    if os.path.exists(gif) and os.path.getsize(gif) > 100:
                         os.remove(fp)
-                        item["file"] = item["file"][:-5] + '.jpg'
-                        item["ext"] = 'jpg'
-                        item["size"] = os.path.getsize(jpg)
+                        item["file"] = item["file"][:-5] + '.gif'
+                        item["ext"] = 'gif'
+                        item["size"] = os.path.getsize(gif)
                         n_wxgf += 1
             print(f"[*] wxgf transcoded: {n_wxgf}")
         except ImportError:
